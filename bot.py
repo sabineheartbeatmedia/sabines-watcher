@@ -117,4 +117,4 @@ async def check_all_accounts():
             continue
 
         known = set(state.get(account, []))
-        new_posts = [p for p in latest if p["sho
+        new_posts = [p for p in latest if p["shortcode"] not in known]
