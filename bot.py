@@ -21,6 +21,7 @@ INSTAGRAM_ACCOUNTS = [
 APIFY_BASE  = "https://api.apify.com/v2"
 STATE_STORE = "sabines-watcher"
 STATE_KEY   = "seen-posts"
+TEST_MODE   = os.environ.get("TEST_MODE", "") == "1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,6 +139,10 @@ async def main():
             known     = set(state.get(account, []))
             new_posts = [p for p in latest if p["shortcode"] not in known]
 
+            if TEST_MODE:
+                new_posts = latest[:1]
+                first_run = False
+
             if not first_run and new_posts:
                 log.info("  → %d neuer Post(s)", len(new_posts))
                 for post in reversed(new_posts):
@@ -148,9 +153,10 @@ async def main():
 
             state[account] = list(known | {p["shortcode"] for p in latest})
 
-        save_state(client, state)
+        if not TEST_MODE:
+            save_state(client, state)
 
-    if first_run:
+    if first_run and not TEST_MODE:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
