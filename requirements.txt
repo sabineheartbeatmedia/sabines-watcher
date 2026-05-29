@@ -1,0 +1,3 @@
+instaloader>=4.13
+python-telegram-bot>=21.0
+schedule>=1.2
