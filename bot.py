@@ -1,3 +1,6 @@
+Hier der komplette Code — **GitHub → bot.py → Stift → Ctrl+A → alles löschen → einfügen → Commit**:
+
+```python
 import os
 import json
 import logging
@@ -37,7 +40,7 @@ def load_state() -> dict:
     if Path(STATE_FILE).exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {acc: [] for acc in INSTAGRAM_ACCOUNTS}
+    return {}
 
 
 def save_state(state: dict):
@@ -96,6 +99,33 @@ def fetch_latest_posts(username: str, count: int = 5) -> list[dict]:
     return posts
 
 
+async def initialize_state():
+    log.info("Erster Start — lerne aktuelle Posts kennen (nichts wird gesendet) …")
+    state = {}
+    for account in INSTAGRAM_ACCOUNTS:
+        log.info("  Merke @%s …", account)
+        try:
+            latest = fetch_latest_posts(account, count=5)
+            state[account] = [p["shortcode"] for p in latest]
+            log.info("  %d Posts von @%s gemerkt.", len(state[account]), account)
+        except Exception as e:
+            log.error("  Fehler bei @%s: %s", account, e)
+            state[account] = []
+    save_state(state)
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=(
+            "✅ *Sabines Watcher ist live!*\n\n"
+            "Ich beobachte ab jetzt täglich um {} Uhr:\n\n"
+            "• @carolinepreussde\n"
+            "• @abovebeyond.coaching\n"
+            "• @mut.marketing"
+        ).format(CHECK_TIME),
+        parse_mode="Markdown",
+    )
+
+
 async def send_new_posts(bot: Bot, account: str, new_posts: list[dict]):
     for post in reversed(new_posts):
         media_type   = "🎬 Video" if post["is_video"] else "🖼️ Post"
@@ -127,7 +157,7 @@ async def send_new_posts(bot: Bot, account: str, new_posts: list[dict]):
 
 
 async def check_all_accounts():
-    log.info("Starte Instagram-Check …")
+    log.info("Starte täglichen Instagram-Check …")
     bot   = Bot(token=TELEGRAM_TOKEN)
     state = load_state()
 
@@ -155,7 +185,7 @@ async def check_all_accounts():
         state[account] = list(known | {p["shortcode"] for p in latest})
 
     save_state(state)
-    log.info("Check abgeschlossen.")
+    log.info("Check abgeschlossen. Nächster Check morgen um %s Uhr.", CHECK_TIME)
 
 
 def run_check():
@@ -163,9 +193,11 @@ def run_check():
 
 
 if __name__ == "__main__":
-    log.info("Bot gestartet. Täglicher Check um %s Uhr.", CHECK_TIME)
+    log.info("Sabines Watcher gestartet. Täglicher Check um %s Uhr.", CHECK_TIME)
     schedule.every().day.at(CHECK_TIME).do(run_check)
-    run_check()
+    asyncio.run(initialize_state())
+    log.info("Bereit. Warte auf %s Uhr …", CHECK_TIME)
     while True:
         schedule.run_pending()
         time.sleep(30)
+```
