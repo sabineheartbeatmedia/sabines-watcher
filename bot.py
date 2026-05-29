@@ -118,3 +118,21 @@ async def check_all_accounts():
 
         known = set(state.get(account, []))
         new_posts = [p for p in latest if p["shortcode"] not in known]
+        
+        state[account] = list(known | {p["shortcode"] for p in latest})
+
+    save_state(state)
+    log.info("Check abgeschlossen.")
+
+
+def run_check():
+    asyncio.run(check_all_accounts())
+
+
+if __name__ == "__main__":
+    log.info("Bot gestartet. Täglicher Check um %s Uhr.", CHECK_TIME)
+    schedule.every().day.at(CHECK_TIME).do(run_check)
+    run_check()
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
