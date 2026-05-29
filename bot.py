@@ -3,14 +3,14 @@ import json
 import logging
 import asyncio
 import httpx
+import time
 from pathlib import Path
 
 import schedule
-import time
 from telegram import Bot
 from telegram.error import TelegramError
 
-# ── Config ──────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 APIFY_TOKEN      = os.environ["APIFY_TOKEN"]
@@ -23,7 +23,8 @@ INSTAGRAM_ACCOUNTS = [
 
 CHECK_TIME = os.environ.get("CHECK_TIME", "09:00")
 STATE_FILE = "/tmp/seen_posts.json"
-# ────────────────────────────────────────────────────────────────────────
+APIFY_BASE = "https://api.apify.com/v2"
+# ─────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,39 +46,59 @@ def save_state(state: dict):
 
 
 def fetch_latest_posts(username: str, count: int = 5) -> list[dict]:
-    url = "https://api.apify.com/v2/acts/apify~instagram-profile-scraper/run-sync-get-dataset-items"
-    params = {"token": APIFY_TOKEN}
-    payload = {
-        "usernames": [username],
-        "resultsLimit": count,
-    }
-    posts = []
-    try:
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(url, params=params, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+    headers = {"Authorization": f"Bearer {APIFY_TOKEN}"}
+    payload = {"usernames": [username], "resultsLimit": count}
 
-        log.info("Apify Antwort für @%s: %s", username, str(data)[:500])
-        for item in data:
-            for post in item.get("latestPosts", []):
-                posts.append({
-                    "shortcode": post.get("shortCode", post.get("id", "")),
-                    "url": post.get("url", f"https://www.instagram.com/p/{post.get('shortCode', '')}/"),
-                    "thumbnail": post.get("displayUrl", ""),
-                    "caption": (post.get("caption") or "")[:400],
-                    "is_video": post.get("type", "") == "Video",
-                    "date": (post.get("timestamp", "") or "")[:10],
-                    "likes": post.get("likesCount", 0),
-                })
-    except Exception as e:
-        log.error("Fehler beim Abrufen von @%s: %s", username, e)
+    with httpx.Client(timeout=30) as client:
+        r = client.post(
+            f"{APIFY_BASE}/acts/apify~instagram-profile-scraper/runs",
+            headers=headers,
+            json=payload,
+        )
+        r.raise_for_status()
+        run_id = r.json()["data"]["id"]
+        log.info("  Apify Run gestartet: %s", run_id)
+
+        for _ in range(36):
+            time.sleep(5)
+            status_r = client.get(
+                f"{APIFY_BASE}/actor-runs/{run_id}",
+                headers=headers,
+            )
+            status = status_r.json()["data"]["status"]
+            log.info("  Run Status: %s", status)
+            if status == "SUCCEEDED":
+                break
+            if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                log.error("  Apify Run fehlgeschlagen: %s", status)
+                return []
+
+        dataset_r = client.get(
+            f"{APIFY_BASE}/actor-runs/{run_id}/dataset/items",
+            headers=headers,
+        )
+        dataset_r.raise_for_status()
+        data = dataset_r.json()
+
+    posts = []
+    for item in data:
+        for post in item.get("latestPosts", []):
+            posts.append({
+                "shortcode": post.get("shortCode", post.get("id", "")),
+                "url":       post.get("url", f"https://www.instagram.com/p/{post.get('shortCode', '')}/"),
+                "thumbnail": post.get("displayUrl", ""),
+                "caption":   (post.get("caption") or "")[:400],
+                "is_video":  post.get("type", "") == "Video",
+                "date":      (post.get("timestamp", "") or "")[:10],
+                "likes":     post.get("likesCount", 0),
+            })
+    log.info("  %d Posts gefunden für @%s", len(posts), username)
     return posts
 
 
 async def send_new_posts(bot: Bot, account: str, new_posts: list[dict]):
     for post in reversed(new_posts):
-        media_type = "🎬 Video" if post["is_video"] else "🖼️ Post"
+        media_type   = "🎬 Video" if post["is_video"] else "🖼️ Post"
         caption_text = f"_{post['caption'][:300]}_" if post["caption"] else "_kein Text_"
         text = (
             f"{media_type} *@{account}*\n\n"
@@ -107,19 +128,30 @@ async def send_new_posts(bot: Bot, account: str, new_posts: list[dict]):
 
 async def check_all_accounts():
     log.info("Starte Instagram-Check …")
-    bot = Bot(token=TELEGRAM_TOKEN)
+    bot   = Bot(token=TELEGRAM_TOKEN)
     state = load_state()
 
     for account in INSTAGRAM_ACCOUNTS:
         log.info("Prüfe @%s …", account)
-        latest = fetch_latest_posts(account, count=5)
-        if not latest:
-            log.warning("  → Keine Posts erhalten für @%s", account)
+        try:
+            latest = fetch_latest_posts(account, count=5)
+        except Exception as e:
+            log.error("Fehler bei @%s: %s", account, e)
             continue
 
-        known = set(state.get(account, []))
+        if not latest:
+            log.warning("  Keine Posts erhalten für @%s", account)
+            continue
+
+        known     = set(state.get(account, []))
         new_posts = [p for p in latest if p["shortcode"] not in known]
-        
+
+        if new_posts:
+            log.info("  → %d neuer Post(s) bei @%s", len(new_posts), account)
+            await send_new_posts(bot, account, new_posts)
+        else:
+            log.info("  → Keine neuen Posts bei @%s", account)
+
         state[account] = list(known | {p["shortcode"] for p in latest})
 
     save_state(state)
