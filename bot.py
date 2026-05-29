@@ -58,6 +58,7 @@ def fetch_latest_posts(username: str, count: int = 5) -> list[dict]:
             resp.raise_for_status()
             data = resp.json()
 
+        log.info("Apify Antwort für @%s: %s", username, str(data)[:500])
         for item in data:
             for post in item.get("latestPosts", []):
                 posts.append({
