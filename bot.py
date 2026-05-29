@@ -1,6 +1,3 @@
-Hier der komplette Code — **GitHub → bot.py → Stift → Ctrl+A → alles löschen → einfügen → Commit**:
-
-```python
 import os
 import json
 import logging
