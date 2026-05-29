@@ -2,17 +2,18 @@ import os
 import json
 import logging
 import asyncio
+import httpx
 from pathlib import Path
 
-import instaloader
 import schedule
 import time
 from telegram import Bot
 from telegram.error import TelegramError
 
 # ── Config ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+APIFY_TOKEN      = os.environ["APIFY_TOKEN"]
 
 INSTAGRAM_ACCOUNTS = [
     "carolinepreussde",
@@ -21,7 +22,7 @@ INSTAGRAM_ACCOUNTS = [
 ]
 
 CHECK_TIME = os.environ.get("CHECK_TIME", "09:00")
-STATE_FILE = "/tmp/seen_posts.json"   # /tmp ist auf Railway beschreibbar
+STATE_FILE = "/tmp/seen_posts.json"
 # ────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -44,30 +45,30 @@ def save_state(state: dict):
 
 
 def fetch_latest_posts(username: str, count: int = 5) -> list[dict]:
-    L = instaloader.Instaloader(
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        download_geotags=False,
-        download_comments=False,
-        save_metadata=False,
-        quiet=True,
-    )
+    url = "https://api.apify.com/v2/acts/apify~instagram-profile-scraper/run-sync-get-dataset-items"
+    params = {"token": APIFY_TOKEN}
+    payload = {
+        "usernames": [username],
+        "resultsLimit": count,
+    }
     posts = []
     try:
-        profile = instaloader.Profile.from_username(L.context, username)
-        for post in profile.get_posts():
-            if len(posts) >= count:
-                break
-            posts.append({
-                "shortcode": post.shortcode,
-                "url": f"https://www.instagram.com/p/{post.shortcode}/",
-                "thumbnail": post.url,
-                "caption": (post.caption or "")[:400],
-                "is_video": post.is_video,
-                "date": post.date_utc.strftime("%d.%m.%Y"),
-                "likes": post.likes,
-            })
+        with httpx.Client(timeout=120) as client:
+            resp = client.post(url, params=params, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        for item in data:
+            for post in item.get("latestPosts", []):
+                posts.append({
+                    "shortcode": post.get("shortCode", post.get("id", "")),
+                    "url": post.get("url", f"https://www.instagram.com/p/{post.get('shortCode', '')}/"),
+                    "thumbnail": post.get("displayUrl", ""),
+                    "caption": (post.get("caption") or "")[:400],
+                    "is_video": post.get("type", "") == "Video",
+                    "date": (post.get("timestamp", "") or "")[:10],
+                    "likes": post.get("likesCount", 0),
+                })
     except Exception as e:
         log.error("Fehler beim Abrufen von @%s: %s", username, e)
     return posts
@@ -84,12 +85,15 @@ async def send_new_posts(bot: Bot, account: str, new_posts: list[dict]):
             f"🔗 {post['url']}"
         )
         try:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=post["thumbnail"],
-                caption=text,
-                parse_mode="Markdown",
-            )
+            if post["thumbnail"]:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=post["thumbnail"],
+                    caption=text,
+                    parse_mode="Markdown",
+                )
+            else:
+                raise TelegramError("Kein Bild")
         except TelegramError:
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -109,34 +113,8 @@ async def check_all_accounts():
         log.info("Prüfe @%s …", account)
         latest = fetch_latest_posts(account, count=5)
         if not latest:
+            log.warning("  → Keine Posts erhalten für @%s", account)
             continue
 
         known = set(state.get(account, []))
-        new_posts = [p for p in latest if p["shortcode"] not in known]
-
-        if new_posts:
-            log.info("  → %d neuer Post(s) bei @%s", len(new_posts), account)
-            await send_new_posts(bot, account, new_posts)
-        else:
-            log.info("  → Keine neuen Posts bei @%s", account)
-
-        state[account] = list(known | {p["shortcode"] for p in latest})
-
-    save_state(state)
-    log.info("Check abgeschlossen.")
-
-
-def run_check():
-    asyncio.run(check_all_accounts())
-
-
-if __name__ == "__main__":
-    log.info("Bot gestartet. Täglicher Check um %s Uhr.", CHECK_TIME)
-
-    # Beim Start einmal prüfen (initialisiert seen_posts.json)
-    run_check()
-
-    schedule.every().day.at(CHECK_TIME).do(run_check)
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+        new_posts = [p for p in latest if p["sho
