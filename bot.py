@@ -4,10 +4,12 @@ import logging
 import asyncio
 import httpx
 import time
+from datetime import date, timedelta
 
 from telegram import Bot
 from telegram.error import TelegramError
 
+# ── Config ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 APIFY_TOKEN      = os.environ["APIFY_TOKEN"]
@@ -18,10 +20,21 @@ INSTAGRAM_ACCOUNTS = [
     "mut.marketing",
 ]
 
-APIFY_BASE  = "https://api.apify.com/v2"
-STATE_STORE = "sabines-watcher"
-STATE_KEY   = "seen-posts"
-TEST_MODE   = os.environ.get("TEST_MODE", "") == "1"
+APIFY_BASE   = "https://api.apify.com/v2"
+STATE_STORE  = "sabines-watcher"   # Name des Apify Key-Value Stores
+STATE_KEY    = "seen-posts"
+MAX_AGE_DAYS = 3   # nur Posts der letzten X Tage gelten als "neu"
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _is_recent(datestr: str) -> bool:
+    """True, wenn das Datum (YYYY-MM-DD) innerhalb der letzten MAX_AGE_DAYS liegt."""
+    try:
+        d = date.fromisoformat((datestr or "")[:10])
+    except Exception:
+        return False
+    return d >= date.today() - timedelta(days=MAX_AGE_DAYS)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +43,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def load_state(client):
+# ── State in Apify KV Store speichern ────────────────────────────────────
+
+def load_state(client: httpx.Client) -> dict:
     url = f"{APIFY_BASE}/key-value-stores/~{STATE_STORE}/records/{STATE_KEY}"
     r = client.get(url, params={"token": APIFY_TOKEN})
     if r.status_code == 200:
@@ -38,12 +53,14 @@ def load_state(client):
     return {}
 
 
-def save_state(client, state):
+def save_state(client: httpx.Client, state: dict):
     url = f"{APIFY_BASE}/key-value-stores/~{STATE_STORE}/records/{STATE_KEY}"
     client.put(url, params={"token": APIFY_TOKEN}, json=state)
 
 
-def fetch_latest_posts(client, username, count=5):
+# ── Instagram Posts via Apify holen ──────────────────────────────────────
+
+def fetch_latest_posts(client: httpx.Client, username: str, count: int = 5) -> list[dict]:
     headers = {"Authorization": f"Bearer {APIFY_TOKEN}"}
     payload = {"usernames": [username], "resultsLimit": count}
 
@@ -90,7 +107,9 @@ def fetch_latest_posts(client, username, count=5):
     return posts
 
 
-async def send_post(bot, account, post):
+# ── Telegram Nachricht senden ─────────────────────────────────────────────
+
+async def send_post(bot: Bot, account: str, post: dict):
     media_type   = "🎬 Video" if post["is_video"] else "🖼️ Post"
     caption_text = f"_{post['caption'][:300]}_" if post["caption"] else "_kein Text_"
     text = (
@@ -117,6 +136,8 @@ async def send_post(bot, account, post):
         )
 
 
+# ── Hauptprogramm ─────────────────────────────────────────────────────────
+
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -137,11 +158,11 @@ async def main():
                 continue
 
             known     = set(state.get(account, []))
-            new_posts = [p for p in latest if p["shortcode"] not in known]
-
-            if TEST_MODE:
-                new_posts = latest[:1]
-                first_run = False
+            # neu = noch nicht gesehen UND wirklich frisch (keine alten Pins)
+            new_posts = [
+                p for p in latest
+                if p["shortcode"] not in known and _is_recent(p["date"])
+            ]
 
             if not first_run and new_posts:
                 log.info("  → %d neuer Post(s)", len(new_posts))
@@ -153,10 +174,9 @@ async def main():
 
             state[account] = list(known | {p["shortcode"] for p in latest})
 
-        if not TEST_MODE:
-            save_state(client, state)
+        save_state(client, state)
 
-    if first_run and not TEST_MODE:
+    if first_run:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
@@ -168,7 +188,7 @@ async def main():
             ),
             parse_mode="Markdown",
         )
-        log.info("Erster Start abgeschlossen.")
+        log.info("Erster Start abgeschlossen — ab jetzt läuft der tägliche Check.")
     else:
         log.info("Check abgeschlossen.")
 
