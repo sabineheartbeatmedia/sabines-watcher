@@ -35,7 +35,6 @@ def _is_recent(datestr: str) -> bool:
         return False
     return d >= date.today() - timedelta(days=MAX_AGE_DAYS)
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
@@ -45,17 +44,35 @@ log = logging.getLogger(__name__)
 
 # ── State in Apify KV Store speichern ────────────────────────────────────
 
-def load_state(client: httpx.Client) -> dict:
-    url = f"{APIFY_BASE}/key-value-stores/~{STATE_STORE}/records/{STATE_KEY}"
+def get_store_id(client: httpx.Client) -> str:
+    """Holt (oder legt an) den benannten KV-Store und gibt dessen ID zurück.
+    Ein PUT auf einen nicht existierenden benannten Store legt ihn NICHT an –
+    deshalb hier zuerst getOrCreate."""
+    r = client.post(
+        f"{APIFY_BASE}/key-value-stores",
+        params={"token": APIFY_TOKEN, "name": STATE_STORE},
+    )
+    r.raise_for_status()
+    store_id = r.json()["data"]["id"]
+    log.info("KV-Store '%s' → ID %s", STATE_STORE, store_id)
+    return store_id
+
+
+def load_state(client: httpx.Client, store_id: str) -> dict:
+    url = f"{APIFY_BASE}/key-value-stores/{store_id}/records/{STATE_KEY}"
     r = client.get(url, params={"token": APIFY_TOKEN})
     if r.status_code == 200:
         return r.json()
+    if r.status_code != 404:
+        log.warning("State laden: unerwarteter Status %s", r.status_code)
     return {}
 
 
-def save_state(client: httpx.Client, state: dict):
-    url = f"{APIFY_BASE}/key-value-stores/~{STATE_STORE}/records/{STATE_KEY}"
-    client.put(url, params={"token": APIFY_TOKEN}, json=state)
+def save_state(client: httpx.Client, store_id: str, state: dict):
+    url = f"{APIFY_BASE}/key-value-stores/{store_id}/records/{STATE_KEY}"
+    r = client.put(url, params={"token": APIFY_TOKEN}, json=state)
+    r.raise_for_status()
+    log.info("State gespeichert (%d Accounts).", len(state))
 
 
 # ── Instagram Posts via Apify holen ──────────────────────────────────────
@@ -112,8 +129,9 @@ def fetch_latest_posts(client: httpx.Client, username: str, count: int = 5) -> l
 async def send_post(bot: Bot, account: str, post: dict):
     media_type   = "🎬 Video" if post["is_video"] else "🖼️ Post"
     caption_text = f"_{post['caption'][:300]}_" if post["caption"] else "_kein Text_"
+    profile_url  = f"https://www.instagram.com/{account}/"
     text = (
-        f"{media_type} *@{account}*\n\n"
+        f"{media_type} [@{account}]({profile_url})\n\n"
         f"{caption_text}\n\n"
         f"❤️ {post['likes']} Likes  •  {post['date']}\n"
         f"🔗 {post['url']}"
@@ -142,7 +160,8 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
 
     with httpx.Client(timeout=30) as client:
-        state = load_state(client)
+        store_id = get_store_id(client)
+        state = load_state(client, store_id)
         first_run = len(state) == 0
 
         for account in INSTAGRAM_ACCOUNTS:
@@ -174,19 +193,22 @@ async def main():
 
             state[account] = list(known | {p["shortcode"] for p in latest})
 
-        save_state(client, state)
+        save_state(client, store_id, state)
 
     if first_run:
+        account_lines = "\n".join(
+            f"• [@{acc}](https://www.instagram.com/{acc}/)"
+            for acc in INSTAGRAM_ACCOUNTS
+        )
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
                 "✅ *Sabines Watcher ist live!*\n\n"
                 "Ich beobachte ab jetzt täglich:\n\n"
-                "• @carolinepreussde\n"
-                "• @abovebeyond.coaching\n"
-                "• @mut.marketing"
+                f"{account_lines}"
             ),
             parse_mode="Markdown",
+            disable_web_page_preview=True,
         )
         log.info("Erster Start abgeschlossen — ab jetzt läuft der tägliche Check.")
     else:
